@@ -1,0 +1,13 @@
+pyproject.toml
+tests/test_array_columns.py
+vvvxflow/array_columns.py
+vvvxflow/errors.py
+vvvxflow/log.py
+vvvxflow/schema_joined_source_detection.py
+vvvxflow/transform_source_detection.py
+vvvxflow/validate.py
+vvvxflow.egg-info/PKG-INFO
+vvvxflow.egg-info/SOURCES.txt
+vvvxflow.egg-info/dependency_links.txt
+vvvxflow.egg-info/requires.txt
+vvvxflow.egg-info/top_level.txt
