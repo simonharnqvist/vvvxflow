@@ -48,23 +48,16 @@ def transform_mods(mods: list[str], table_name: str, schema: StructField, cols_t
 
     # Use the database
     spark.sql(f"USE {db_name}")
-
-    logger.info("Checkpoint 21")
     
     if not spark.catalog.tableExists(table_name):
-        logger.info("Checkpoint 210")
         shutil.rmtree(Path(warehouse_path).joinpath(db_name + ".db").joinpath(table_name), ignore_errors=True)
-        logger.info("Checkpoint 211")
         empty_df = spark.createDataFrame([], schema=schema)
-        logger.info("Checkpoint 212")
         empty_df.write.format("parquet").mode("overwrite").saveAsTable(table_name)
-    logger.info("Checkpoint 22")
 
     # Create processed mods tracking table if it doesn't exist
     processed_table = table_name + "_mods_processed"
     if not spark.catalog.tableExists(processed_table):
         shutil.rmtree(Path(warehouse_path).joinpath(db_name + ".db").joinpath(processed_table), ignore_errors=True)
-        logger.info("Checkpoint 23")
         spark.sql(f"""
             CREATE TABLE IF NOT EXISTS {processed_table} (
                 mod STRING,
@@ -76,7 +69,6 @@ def transform_mods(mods: list[str], table_name: str, schema: StructField, cols_t
     # Get list of already processed mods from metadata table
     processed_mods_df = spark.table(processed_table).select("mod")
     processed_mods = [row.mod for row in processed_mods_df.collect()]
-    logger.info("Checkpoint 24")
 
     # Filter mods to process only those not processed yet
     mods_to_process = [m for m in mods if m not in processed_mods]
@@ -93,7 +85,6 @@ def transform_mods(mods: list[str], table_name: str, schema: StructField, cols_t
                              source_path=source_path, detection_path=detection_path,
                              warehouse_path=warehouse_path, db_name=db_name, 
                              spark=spark)
-        logger.info("Checkpoint 25")
 
         # Record this mod as processed in the tracking table
         spark.sql(f"""
@@ -118,7 +109,6 @@ def pipeline(config_file: str = "config.toml", spark: SparkSession = None) -> No
 
 
     logger = get_logger(log_file = config["run_configs"]["logfile"])
-    logger.info("Checkpoint 1")
 
     if not spark:
         spark = (
@@ -130,20 +120,14 @@ def pipeline(config_file: str = "config.toml", spark: SparkSession = None) -> No
         )
         return spark
 
-    logger.info("Checkpoint 2")
-    if config["run_configs"]["mods"] is None or config["run_configs"]["mods"] == []:
+    if "mods" not in config["run_configs"]:
         mods = get_mods(detection_path = config["parquet_paths"]["detection"],
                     source_path = config["parquet_paths"]["source"])
     else:
         mods = config["run_configs"]["mods"]
     
     schema = schema_joined_source_detection
-
-    logger.info("Checkpoint 3")
     
-    #register_db(spark = spark, db_name = config["spark_warehouse"]["db_name"], warehouse_path = config["spark_warehouse"]["path"])
-
-    logger.info("Checkpoint 4")
     transform_mods(
         mods = mods,
         table_name = config["run_configs"]["output_table_name"],
