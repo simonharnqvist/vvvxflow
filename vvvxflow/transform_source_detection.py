@@ -13,6 +13,70 @@ from vvvxflow.array_columns import make_array_cols
 from vvvxflow.log import get_logger
 from vvvxflow.schema_joined_source_detection import schema_joined_source_detection
 
+from pyspark.sql import SparkSession
+from pyspark.sql.utils import AnalysisException
+from pathlib import Path
+import logging
+
+logger = logging.getLogger(__name__)
+spark = SparkSession.builder.getOrCreate()
+
+def create_or_use_tables(table_name: str, db_name: str, warehouse_path: str, schema: StructField, logger: logging.Logger):
+    """
+    Ensure that a database and both target and metadata tables exist.
+    If parquet backing doesn't exist, create it.
+    """
+
+    # Create DB if needed
+    db_path = Path(warehouse_path).joinpath(f"{db_name}.db")
+    spark.sql(f"CREATE DATABASE IF NOT EXISTS {db_name} LOCATION '{db_path}'")
+    logger.info(f"Ensured database {db_name} exists at {db_path}")
+
+    metadata_table_name = f"{table_name}_metadata"
+
+    # Table locations
+    table_path = db_path.joinpath(table_name)
+    metadata_path = db_path.joinpath(metadata_table_name)
+
+    # Use Hadoop FS to check for parquet existence (works on S3, ADLS, etc.)
+    hadoop_fs = spark._jvm.org.apache.hadoop.fs.FileSystem.get(spark._jsc.hadoopConfiguration())
+    def exists(path: Path):
+        return hadoop_fs.exists(spark._jvm.org.apache.hadoop.fs.Path(str(path)))
+
+    # Check table existence
+    table_exists = spark.catalog.tableExists(f"{db_name}.{table_name}")
+    metadata_exists = spark.catalog.tableExists(f"{db_name}.{metadata_table_name}")
+
+    # ---- Target Table ----
+    if not table_exists and exists(table_path):
+        spark.sql(f"CREATE TABLE IF NOT EXISTS {db_name}.{table_name} USING PARQUET LOCATION '{table_path}'")
+        logger.info(f"Registered existing parquet-backed table {db_name}.{metadata_table_name} at {table_path}")
+    elif not table_exists and not exists(table_path):
+        logger.info(f"Creating new parquet-backed table {db_name}.{table_name} at {table_path}")
+        empty_df = spark.createDataFrame([], schema=schema)
+        empty_df.write.mode("overwrite").format("parquet").saveAsTable(f"{db_name}.{table_name}")
+    else:
+        logger.info(f"Table {db_name}.{metadata_table_name} already exists — skipping creation")
+
+    # ---- Metadata Table ----
+    if not metadata_exists and exists(metadata_path):
+        spark.sql(f"CREATE TABLE IF NOT EXISTS {db_name}.{metadata_table_name} USING PARQUET LOCATION '{metadata_path}'")
+        logger.info(f"Registered existing metadata table {db_name}.{metadata_table_name} at {metadata_path}")
+    elif not metadata_exists and not exists(metadata_path):
+        logger.info(f"Creating metadata table {db_name}.{metadata_table_name} at {metadata_path}")
+        spark.sql(f"""
+            CREATE TABLE IF NOT EXISTS {db_name}.{metadata_table_name} (
+                mod STRING,
+                timestamp TIMESTAMP
+            )
+            USING PARQUET
+            LOCATION '{metadata_path}'
+        """)
+    else:
+        logger.info(f"Metadata table {db_name}.{metadata_table_name} already exists — skipping creation")
+
+    
+
 def transform_single_mod(mod: str, table_name: str, cols_to_transform: list[str], order_by:str, source_path: str, detection_path: str, warehouse_path: str, db_name: str, spark: SparkSession):
     """Transform single modulus partition and load into target table"""
     
@@ -26,9 +90,8 @@ def transform_single_mod(mod: str, table_name: str, cols_to_transform: list[str]
     
     joined.createOrReplaceTempView("temp_view")
     
-    spark.sql(f"USE {db_name}")
     spark.sql(f"""
-            INSERT INTO {table_name}
+            INSERT INTO {db_name}.{table_name}
             SELECT *
             FROM temp_view
         """)
@@ -38,39 +101,12 @@ def transform_single_mod(mod: str, table_name: str, cols_to_transform: list[str]
 def transform_mods(mods: list[str], table_name: str, schema: StructField, cols_to_transform: list[str], order_by: str, source_path: str, detection_path: str, warehouse_path: str, db_name: str, spark: SparkSession, logger: logging.Logger):
     """Iterate over mod partitions and transform each"""
 
-    # Create database if not exists
-    spark.sql(f"""
-        CREATE DATABASE IF NOT EXISTS {db_name}
-        LOCATION '{Path(warehouse_path).joinpath(db_name + ".db")}'
-    """)
+    create_or_use_tables(table_name = table_name, db_name = db_name, warehouse_path = warehouse_path, schema = schema, logger = logger)
 
-    logger.info(f"Created db {db_name} at {Path(warehouse_path).joinpath(db_name + '.db')}")
-
-    # Use the database
-    spark.sql(f"USE {db_name}")
-    
-    if not spark.catalog.tableExists(table_name):
-        shutil.rmtree(Path(warehouse_path).joinpath(db_name + ".db").joinpath(table_name), ignore_errors=True)
-        empty_df = spark.createDataFrame([], schema=schema)
-        empty_df.write.format("parquet").mode("overwrite").saveAsTable(table_name)
-
-    # Create processed mods tracking table if it doesn't exist
-    processed_table = table_name + "_mods_processed"
-    if not spark.catalog.tableExists(processed_table):
-        shutil.rmtree(Path(warehouse_path).joinpath(db_name + ".db").joinpath(processed_table), ignore_errors=True)
-        spark.sql(f"""
-            CREATE TABLE IF NOT EXISTS {processed_table} (
-                mod STRING,
-                processed_at TIMESTAMP
-            )
-            USING PARQUET
-        """)
-
-    # Get list of already processed mods from metadata table
-    processed_mods_df = spark.table(processed_table).select("mod")
-    processed_mods = [row.mod for row in processed_mods_df.collect()]
-
-    # Filter mods to process only those not processed yet
+    # Skip mods already processed
+    metadata_table = table_name + "_metadata"
+    processed = spark.sql(f"SELECT mod FROM {db_name}.{metadata_table}")
+    processed_mods = [row.mod for row in processed.collect()]
     mods_to_process = [m for m in mods if m not in processed_mods]
 
     logger.info(f"Skipping {len(mods) - len(mods_to_process)} mods already processed.")
@@ -78,7 +114,7 @@ def transform_mods(mods: list[str], table_name: str, schema: StructField, cols_t
 
     # Process new mods
     for mod in tqdm.tqdm(mods_to_process):
-        logger.info(f"Processing {mod}...")
+        logger.info(f"Processing {mod}")
         transform_single_mod(mod=mod, table_name=table_name, 
                              cols_to_transform=cols_to_transform, 
                              order_by = order_by,
@@ -88,10 +124,8 @@ def transform_mods(mods: list[str], table_name: str, schema: StructField, cols_t
 
         # Record this mod as processed in the tracking table
         spark.sql(f"""
-            INSERT INTO {processed_table} VALUES ('{mod}', current_timestamp())
+            INSERT INTO {db_name}.{metadata_table} VALUES ('{mod}', current_timestamp())
         """)
-
-        logger.info(f"done")
 
     logger.info("Processing complete.")
 
